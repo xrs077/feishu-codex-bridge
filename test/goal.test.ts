@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseGoalTrigger } from '../src/bot/handle-message';
+import { parseGoalTrigger, parsePlanTrigger } from '../src/bot/handle-message';
 import { buildGoalDoneCard } from '../src/card/goal-card';
 import { isGoalSuccess, isGoalTerminal } from '../src/agent/types';
 
@@ -39,6 +39,18 @@ describe('parseGoalTrigger', () => {
     expect(parseGoalTrigger('/goal')).toBeNull();
     expect(parseGoalTrigger('   /goal   ')).toBeNull();
     expect(parseGoalTrigger('普通消息，没有触发词')).toBeNull();
+  });
+});
+
+describe('parsePlanTrigger', () => {
+  it('extracts a native Plan prompt after an optional mention', () => {
+    expect(parsePlanTrigger('/plan 审计接口')).toBe('审计接口');
+    expect(parsePlanTrigger('@机器人 /PLAN 设计迁移\n列出风险')).toBe('设计迁移\n列出风险');
+  });
+
+  it('does not treat a path or empty command as Plan Mode', () => {
+    expect(parsePlanTrigger('src/plan/index.ts')).toBeNull();
+    expect(parsePlanTrigger('/plan  ')).toBeNull();
   });
 });
 

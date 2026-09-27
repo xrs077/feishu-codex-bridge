@@ -126,6 +126,10 @@ export type AgentEvent =
   | { type: 'turn_started'; turnId: string }
   | { type: 'text_delta'; itemId: string; delta: string }
   | { type: 'text'; itemId: string; text: string }
+  | { type: 'plan_delta'; itemId: string; delta: string }
+  | { type: 'plan'; itemId: string; text: string }
+  | { type: 'plan_steps'; explanation: string | null; steps: Array<{ step: string; status: string }> }
+  | { type: 'native_request_resolved'; requestId: number | string }
   | { type: 'thinking_delta'; itemId: string; delta: string }
   | { type: 'thinking'; itemId: string; text: string }
   | { type: 'tool_use'; itemId: string; title: string; detail?: string; kind?: ToolKind }
@@ -192,6 +196,18 @@ export interface AgentRun {
   lastActivity?(): number;
 }
 
+/** A Codex server request bound to the current app-server connection and turn. */
+export interface NativeRequest {
+  requestId: number | string;
+  method: string;
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  params: Record<string, unknown>;
+  respond(result: unknown): void;
+  reject(): void;
+}
+
 /** Outcome of a manual {@link AgentThread.compact}. `compacted` is true iff codex
  * emitted a thread/compacted notice (false ⇒ nothing to compact). `usage` is the
  * post-compaction token usage when codex reported one, else null. */
@@ -204,12 +220,15 @@ export interface CompactResult {
 export interface TurnOptions {
   model?: string;
   effort?: ReasoningEffort;
+  collaborationMode?: 'plan' | 'default';
 }
 
 export interface AgentThread {
   /** backend session id（codex 的 thread id，其它后端可能是 session UUID）——持久化进
    * SessionRecord.sessionId，重启后经 resumeThread 找回同一会话。 */
   readonly sessionId: string;
+  /** Register the UI that will answer native app-server requests for this run. */
+  setNativeRequestHandler?(handler: ((request: NativeRequest) => Promise<void> | void) | null): void;
   /** start a turn, streaming events until turn completion/error */
   runStreamed(input: AgentInput, turn?: TurnOptions): AgentRun;
   /**

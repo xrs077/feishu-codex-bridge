@@ -11,6 +11,7 @@ import type {
   HistoryTool,
   HistoryTurn,
   ModelInfo,
+  NativeRequest,
   PermissionMode,
   ReasoningEffort,
   ResumeThreadOptions,
@@ -21,13 +22,13 @@ import type {
 } from '../types';
 import { isGoalTerminal } from '../types';
 import { BRIDGE_DEVELOPER_INSTRUCTIONS } from '../bridge-instructions';
-import { AppServerClient } from './app-server-client';
+import { AppServerClient, type AppServerRequest } from './app-server-client';
 import { refillWarmPool, takeWarmClient, utilityRequest } from './client-pool';
 import { mapNotification } from './event-map';
 import { codexVersionAsync, resolveCodexBin } from './locate';
 import type { ServerNotification, Thread, ThreadItem, Turn, TurnStartResponse } from './protocol';
 
-const APPROVAL_POLICY = 'never';
+const APPROVAL_POLICY = 'on-request';
 
 /**
  * Map a permission tier to the thread/start|resume params that enforce it.
@@ -167,7 +168,7 @@ export async function generateCodexSessionTitleWithClient(
   const started = await client.request<{ thread: { id: string } }>('thread/start', {
     cwd: opts.cwd,
     model: opts.model,
-    approvalPolicy: APPROVAL_POLICY,
+    approvalPolicy: 'never',
     sandbox: 'read-only',
     ephemeral: true,
     // Match Codex App's isolated background job: no web search, hooks, fanout,
@@ -272,6 +273,12 @@ function withTitleDeadline<T>(work: Promise<T>, timeoutMs = TITLE_GENERATION_TIM
 
 class CodexThread implements AgentThread {
   private currentTurnId: string | undefined;
+  private lastCollaborationMode?: 'plan' | 'default';
+  private readonly pendingNativeRequests = new Set<number | string>();
+  private nativeTurnId?: string;
+  private awaitingNativeTurn = false;
+  private readonly bufferedNativeRequests: AppServerRequest[] = [];
+  private nativeRequestHandler: ((request: NativeRequest) => Promise<void> | void) | null = null;
 
   constructor(
     private readonly client: AppServerClient,
@@ -280,9 +287,78 @@ class CodexThread implements AgentThread {
     private effort: ReasoningEffort | undefined,
   ) {}
 
+  setNativeRequestHandler(handler: ((request: NativeRequest) => Promise<void> | void) | null): void {
+    this.nativeRequestHandler = handler;
+    if (!handler) {
+      this.client.setServerRequestHandler(null);
+      this.rejectBufferedNativeRequests();
+      return;
+    }
+    this.client.setServerRequestHandler((request) => {
+      const params = request.params && typeof request.params === 'object'
+        ? request.params as Record<string, unknown> : {};
+      if (params.threadId !== this.sessionId || typeof params.turnId !== 'string'
+        || typeof params.itemId !== 'string') {
+        this.client.rejectServerRequest(request.id);
+        return;
+      }
+      if (!this.nativeTurnId && this.awaitingNativeTurn) {
+        this.bufferedNativeRequests.push(request);
+        return;
+      }
+      if (params.turnId !== this.nativeTurnId) {
+        this.client.rejectServerRequest(request.id);
+        return;
+      }
+      this.dispatchNativeRequest(request, params, handler);
+    });
+  }
+
+  private dispatchNativeRequest(
+    request: AppServerRequest,
+    params: Record<string, unknown>,
+    handler: (request: NativeRequest) => Promise<void> | void,
+  ): void {
+    this.pendingNativeRequests.add(request.id);
+    const native: NativeRequest = {
+      requestId: request.id,
+      method: request.method,
+      threadId: this.sessionId,
+      turnId: params.turnId as string,
+      itemId: params.itemId as string,
+      params,
+      respond: (result) => {
+        this.client.respond(request.id, result);
+        this.pendingNativeRequests.delete(request.id);
+      },
+      reject: () => {
+        this.client.rejectServerRequest(request.id);
+        this.pendingNativeRequests.delete(request.id);
+      },
+    };
+    void Promise.resolve().then(() => handler(native)).catch((err: unknown) => {
+      log.fail('agent', err, { phase: 'native-request', method: request.method });
+      native.reject();
+    });
+  }
+
+  private flushBufferedNativeRequests(handler: (request: NativeRequest) => Promise<void> | void): void {
+    for (const request of this.bufferedNativeRequests.splice(0)) {
+      const params = request.params as Record<string, unknown>;
+      if (params.turnId === this.nativeTurnId) this.dispatchNativeRequest(request, params, handler);
+      else this.client.rejectServerRequest(request.id);
+    }
+  }
+
+  private rejectBufferedNativeRequests(): void {
+    for (const request of this.bufferedNativeRequests.splice(0)) this.client.rejectServerRequest(request.id);
+  }
+
   runStreamed(input: AgentInput, turn?: TurnOptions): AgentRun {
     const self = this;
     this.currentTurnId = undefined;
+    this.nativeTurnId = undefined;
+    this.awaitingNativeTurn = true;
     // Per-turn overrides persist for subsequent turns (matches turn/start semantics).
     if (turn?.model) this.model = turn.model;
     if (turn?.effort) this.effort = turn.effort;
@@ -296,6 +372,13 @@ class CodexThread implements AgentThread {
     };
     if (self.model) params.model = self.model;
     if (self.effort) params.effort = self.effort;
+    const collaborationMode = turn?.collaborationMode ?? (self.lastCollaborationMode === 'plan' ? 'default' : undefined);
+    if (collaborationMode) {
+      if (!self.model) throw new Error('Plan Mode requires a resolved Codex model');
+      params.collaborationMode = { mode: collaborationMode, settings: {
+        model: self.model, reasoning_effort: self.effort ?? null, developer_instructions: null,
+      } };
+    }
 
     // Fire turn/start NOW — at runStreamed() call time, NOT lazily on the first
     // next() — so model inference runs in parallel with the caller's card setup
@@ -313,12 +396,18 @@ class CodexThread implements AgentThread {
     const started = self.client.request<TurnStartResponse>('turn/start', params)
       .then((result) => {
         if (!result.turn?.id) throw new Error('turn/start response missing turn id');
+        if (collaborationMode) self.lastCollaborationMode = collaborationMode;
         activeTurnId = result.turn.id;
+        self.nativeTurnId = result.turn.id;
+        self.awaitingNativeTurn = false;
+        if (self.nativeRequestHandler) self.flushBufferedNativeRequests(self.nativeRequestHandler);
         return { turnId: result.turn.id };
       })
       .catch((err: unknown) => {
         const error = err instanceof Error ? err : new Error(String(err));
         log.fail('agent', error, { phase: 'turn/start' });
+        self.awaitingNativeTurn = false;
+        self.rejectBufferedNativeRequests();
         return { error };
       });
     async function* gen(): AsyncGenerator<AgentEvent> {
@@ -332,6 +421,7 @@ class CodexThread implements AgentThread {
         // remain queued and steal the next request's first notification.
         for await (const notification of self.client.stream()) {
           const p = notification.params;
+          if (notification.method === 'serverRequest/resolved') self.pendingNativeRequests.delete(notification.params.requestId);
           if (!('threadId' in p) || p.threadId !== self.sessionId) continue;
           if ('turnId' in p && p.turnId !== result.turnId) continue;
           if ('turn' in p && p.turn.id !== result.turnId) continue;
@@ -349,14 +439,20 @@ class CodexThread implements AgentThread {
         }
       } finally {
         activeTurnId = undefined;
+        self.nativeTurnId = undefined;
+        self.awaitingNativeTurn = false;
+        self.rejectBufferedNativeRequests();
       }
     }
-    return { events: gen(), turnId: () => activeTurnId, lastActivity: () => lastActivityAt };
+    return { events: gen(), turnId: () => activeTurnId,
+      lastActivity: () => self.pendingNativeRequests.size ? Date.now() : lastActivityAt };
   }
 
   runGoal(objective: string): AgentRun {
     const self = this;
     this.currentTurnId = undefined;
+    this.nativeTurnId = undefined;
+    this.awaitingNativeTurn = true;
     // Same liveness clock as runStreamed — the goal's 30min idle backstop must
     // also see raw activity, not just mapped events.
     let lastActivityAt = Date.now();
@@ -405,11 +501,15 @@ class CodexThread implements AgentThread {
             return;
           }
           if (step.done) return;
+          if (step.value.method === 'serverRequest/resolved') self.pendingNativeRequests.delete(step.value.params.requestId);
           lastActivityAt = Date.now();
           const ev = mapNotification(step.value);
           if (!ev) continue;
           if (ev.type === 'turn_started') {
             self.currentTurnId = ev.turnId;
+            self.nativeTurnId = ev.turnId;
+            self.awaitingNativeTurn = false;
+            if (self.nativeRequestHandler) self.flushBufferedNativeRequests(self.nativeRequestHandler);
             armed = true; // a real turn for our goal is running
             turnActive = true;
             yield ev;
@@ -417,6 +517,8 @@ class CodexThread implements AgentThread {
           }
           if (ev.type === 'done') {
             turnActive = false;
+            self.nativeTurnId = undefined;
+            self.awaitingNativeTurn = true;
             yield ev;
             // The goal is terminal AND its final turn just finished — now stop.
             if (goalDone) return;
@@ -444,9 +546,13 @@ class CodexThread implements AgentThread {
       } finally {
         await stream.return?.();
         self.currentTurnId = undefined;
+        self.nativeTurnId = undefined;
+        self.awaitingNativeTurn = false;
+        self.rejectBufferedNativeRequests();
       }
     }
-    return { events: gen(), turnId: () => self.currentTurnId, lastActivity: () => lastActivityAt };
+    return { events: gen(), turnId: () => self.currentTurnId,
+      lastActivity: () => self.pendingNativeRequests.size ? Date.now() : lastActivityAt };
   }
 
   async clearGoal(): Promise<void> {

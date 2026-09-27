@@ -71,6 +71,8 @@ import {
   type SessionTitleBackendConfig,
 } from '../config/schema';
 import { CardDispatcher } from '../card/dispatcher';
+import { NativeRequestBridge } from './native-requests';
+import { NativePlanCard } from './native-plan';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
 import { finalMessageText, initialState, reduce, type RunState } from '../card/run-state';
@@ -423,6 +425,7 @@ export interface QueuedTurn {
   requestedAt: number;
   /** Clean user-authored label; never derive reminder copy from woven input. */
   summary?: string;
+  collaborationMode?: 'plan';
 }
 
 /** Switch the mutable session control state to a queued follow-up. Exported as
@@ -574,6 +577,11 @@ export function parseGoalTrigger(text: string): string | null {
     .replace(/\s+/g, ' ')
     .trim();
   return objective.length > 0 ? objective : null;
+}
+
+/** A native Codex Plan turn. A leading @mention may precede the command. */
+export function parsePlanTrigger(text: string): string | null {
+  return /(?:^|\s)\/plan\s+([\s\S]+)$/i.exec(text)?.[1]?.trim() || null;
 }
 
 // ── M-6 Reaction 入站：零打字驱动 ────────────────────────────────────
@@ -979,6 +987,12 @@ export function createOrchestrator(
     // run (OKR reaction as the receipt, streaming cards, then a terminal card).
     // Explicit slash COMMANDS above still take priority (clear, leading intent).
     const goalObjective = parseGoalTrigger(text);
+    const planPrompt = parsePlanTrigger(text);
+    if (/(?:^|\s)\/plan\s*$/i.test(text)) {
+      await channel.send(msg.chatId, { markdown: '用法：`/plan <任务>`。' },
+        { replyTo: msg.messageId, replyInThread: Boolean(msg.threadId) }).catch(() => undefined);
+      return;
+    }
 
     // Single-session group: the whole group is one session keyed by chatId. No
     // topics — reply by quoting (引用回复); runs serialize per chatId (active[chatId]).
@@ -1024,7 +1038,7 @@ export function createOrchestrator(
         startReservedRun(msg, goalObjective, ts.sessionKey, true, project, ts, undefined, undefined, undefined, true);
         return;
       }
-      void handleTurn(msg, text, ts.sessionKey, true, project, ts).catch((err) => log.fail('intake', err));
+      void handleTurn(msg, planPrompt ?? text, ts.sessionKey, true, project, ts, planPrompt ? 'plan' : undefined).catch((err) => log.fail('intake', err));
       return;
     }
 
@@ -1074,7 +1088,7 @@ export function createOrchestrator(
         startReservedRun(msg, goalObjective, ts.sessionKey, false, project, ts, undefined, undefined, undefined, true);
         return;
       }
-      void handleTurn(msg, text, ts.sessionKey, false, project, ts).catch((err) => log.fail('intake', err));
+      void handleTurn(msg, planPrompt ?? text, ts.sessionKey, false, project, ts, planPrompt ? 'plan' : undefined).catch((err) => log.fail('intake', err));
       return;
     }
     // Main group area: /resume opens the history picker; /settings opens the
@@ -1133,11 +1147,11 @@ export function createOrchestrator(
       log.info('intake', 'unknown-cmd', { name });
       return;
     }
-    startTopicDirectly(msg, text, project);
+    startTopicDirectly(msg, planPrompt ?? text, project, false, planPrompt ? 'plan' : undefined);
   };
 
   /** Parse a leading slash command; null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'compact' | 'context' | 'clear' | null {
+  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'compact' | 'context' | 'clear' | 'plan' | null {
     const m = /^\/(\w+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
     return name === 'resume' ||
@@ -1146,7 +1160,8 @@ export function createOrchestrator(
       name === 'help' ||
       name === 'compact' ||
       name === 'context' ||
-      name === 'clear'
+      name === 'clear' ||
+      name === 'plan'
       ? name
       : null;
   }
@@ -1263,14 +1278,14 @@ export function createOrchestrator(
    * the chatId (single, `flat`). steer/queue mid-turn; otherwise reserve + run.
    * `flat` = reply by quoting (no reply_in_thread / topic), for single groups.
    */
-  function handleTurn(msg: NormalizedMessage, text: string, sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm): Promise<void> {
+  function handleTurn(msg: NormalizedMessage, text: string, sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm, collaborationMode?: 'plan'): Promise<void> {
     const owner = active.get(sessionKey);
     return orderTurns(sessionKey, async () => {
       if (owner?.intakeCancelled) {
         await channel.send(msg.chatId, { markdown: '排队期间会话已停止，请重发本条消息。' }, { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
         return;
       }
-      await prepareTurn(msg, text, sessionKey, flat, project, perm);
+      await prepareTurn(msg, text, sessionKey, flat, project, perm, collaborationMode);
     });
   }
 
@@ -1281,6 +1296,7 @@ export function createOrchestrator(
     flat: boolean,
     project: Project | undefined,
     perm: TurnPerm,
+    collaborationMode?: 'plan',
   ): Promise<void> {
     // Mid-turn: steer (引导) or queue (排队).
     const existing = active.get(sessionKey);
@@ -1307,7 +1323,7 @@ export function createOrchestrator(
       // If it's gone, start a fresh run (carrying what we already fetched).
       const cur = active.get(sessionKey);
       if (!cur) {
-        startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text);
+        startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text, false, collaborationMode);
         return;
       }
       // A goal may have started while media downloaded — same prompt as above.
@@ -1315,12 +1331,12 @@ export function createOrchestrator(
         await replyGoalBusy(msg, flat);
         return;
       }
-      void deliverPreparedTurn(msg, woven, images, text, sessionKey, flat, project, perm, cur)
+      void deliverPreparedTurn(msg, woven, images, text, sessionKey, flat, project, perm, cur, collaborationMode)
         .catch((err) => log.fail('intake', err));
       return;
     }
 
-    startReservedRun(msg, text, sessionKey, flat, project, perm);
+    startReservedRun(msg, text, sessionKey, flat, project, perm, undefined, undefined, undefined, false, collaborationMode);
   }
 
   // Keep preparation ordered, but do not pin the lane on an uncertain steer ACK.
@@ -1328,8 +1344,9 @@ export function createOrchestrator(
   async function deliverPreparedTurn(
     msg: NormalizedMessage, woven: IngestedContext, images: string[] | undefined, text: string,
     sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm, cur: ActiveState,
+    collaborationMode?: 'plan',
   ): Promise<void> {
-    if (getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread && cur.thread.supportsSteer !== false) {
+    if (!collaborationMode && getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread && cur.thread.supportsSteer !== false) {
       const tid = cur.run.turnId();
       if (tid) {
         const voiceReply = cur.voiceReply?.run === cur.run ? cur.voiceReply : undefined;
@@ -1360,7 +1377,7 @@ export function createOrchestrator(
       active.delete(sessionKey);
       if (sessions.get(sessionKey) === cur.thread) sessions.delete(sessionKey);
     }
-    startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text);
+    startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text, false, collaborationMode);
   }
 
   /** 🎯 goal 运行中收到消息的统一提示（goal 会话不入队，见 ActiveState.isGoal）。 */
@@ -1396,6 +1413,7 @@ export function createOrchestrator(
     preIngested?: IngestedContext,
     summaryText?: string,
     goal?: boolean,
+    collaborationMode?: 'plan',
   ): void {
     // A goal title is the already-extracted objective. Ordinary turns retain
     // the SDK content type so merge-forward/media envelopes can be decoded
@@ -1429,6 +1447,7 @@ export function createOrchestrator(
         requesterOpenId: msg.senderId,
         requestedAt: msg.createTime || Date.now(),
         summary: stripFileTokens(summaryText ?? text).slice(0, 80) || undefined,
+        collaborationMode,
       });
       log.info('intake', 'queued', { depth: existing.queue.length });
       return;
@@ -1607,6 +1626,7 @@ export function createOrchestrator(
           model,
           effort,
           firstText,
+          collaborationMode,
           voice: ingested.voice,
           images,
           knownThreadId: sessionKey,
@@ -1738,7 +1758,7 @@ export function createOrchestrator(
   /** Group @bot (no topic): create the topic + run with the default model.
    * Detached — onMessage must return fast (see {@link handleTurn}); a new
    * topic has a unique reply target so no same-topic reservation is needed. */
-  function startTopicDirectly(msg: NormalizedMessage, text: string, project?: Project, goal?: boolean): void {
+  function startTopicDirectly(msg: NormalizedMessage, text: string, project?: Project, goal?: boolean, collaborationMode?: 'plan'): void {
     const titleSource: SessionTitleSource = goal
       ? { text, rawContentType: 'text' }
       : sessionTitleSourceFromMessage(msg, text);
@@ -1808,6 +1828,7 @@ export function createOrchestrator(
         replyInThread: true,
         thread,
         firstText,
+        collaborationMode,
         voice: voiceReply,
         images,
         model,
@@ -2162,6 +2183,14 @@ export function createOrchestrator(
 
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
+  const nativeRequests = new NativeRequestBridge(channel, dispatcher, async (evt, pending) => {
+    const openId = evt.operator?.openId ?? '';
+    if (!openId || !isChatAllowed(cfg, evt.chatId)) return false;
+    const project = await getProjectByChatId(evt.chatId);
+    return Boolean(project && project.cwd === pending.cwd &&
+      isUserAllowedInProject(cfg, project, openId) &&
+      (openId === pending.requesterOpenId || isAdmin(cfg, openId)));
+  });
   const outboundFiles = new OutboundFiles(paths.outboundFilesDir);
   void outboundFiles.recover(channel);
   outboundFiles.register(dispatcher, async (record, openId) => {
@@ -3989,6 +4018,7 @@ export function createOrchestrator(
     replyInThread?: boolean;
     thread: AgentThread;
     firstText: string;
+    collaborationMode?: 'plan';
     /** local image paths for the FIRST turn (codex reads them as localImage) */
     images?: string[];
     /** when the topic thread_id is already known (turn in an existing topic) */
@@ -4246,6 +4276,7 @@ export function createOrchestrator(
         requesterOpenId: opts.requesterOpenId,
         requestedAt: opts.requestedAt ?? Date.now(),
         summary: opts.summary,
+        collaborationMode: opts.collaborationMode,
       };
       let replyTo = opts.replyTo;
       let replyInThread = opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId));
@@ -4270,7 +4301,18 @@ export function createOrchestrator(
         const turnModel = rec?.model ?? opts.model;
         const turnEffort = rec?.effort ?? opts.effort;
         const modelDisp = getModelDisplay(cfg);
-        const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+        opts.thread.setNativeRequestHandler?.((request) => nativeRequests.receive(request, {
+          chatId: opts.chatId,
+          cwd: runCwd,
+          requesterOpenId: currentTurn.requesterOpenId ?? '',
+          replyTo,
+          replyInThread,
+        }));
+        if (currentTurn.collaborationMode && !opts.thread.setNativeRequestHandler) {
+          throw new Error('原生 Plan Mode 仅支持 Codex app-server 后端');
+        }
+        const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort, collaborationMode: currentTurn.collaborationMode });
+        const planCard = new NativePlanCard(channel, opts.chatId, replyTo, replyInThread);
         titleTurnAttempted = true;
         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
         state.run = run;
@@ -4499,6 +4541,7 @@ export function createOrchestrator(
             await splitCard(ev);
             continue;
           }
+          planCard.apply(ev);
           const tEv = Date.now();
           if (!firstEvAt) firstEvAt = tEv;
           const et = (ev as { type?: string }).type;
@@ -4507,6 +4550,10 @@ export function createOrchestrator(
             // remainder of that turn; the binding was persisted before this loop.
             beginSessionTitle();
             requestSessionTitleApply();
+          }
+          if (ev.type === 'native_request_resolved') {
+            nativeRequests.closeRequest(opts.thread.sessionId, ev.requestId);
+            continue;
           }
           if (et === 'text_delta') {
             if (!firstTextAt) firstTextAt = tEv;
@@ -4538,6 +4585,8 @@ export function createOrchestrator(
           // typewriter (cardElement.content), structure → whole-card update.
           stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
         }
+        await planCard.finish();
+        nativeRequests.closeThread(opts.thread.sessionId);
         clearInterval(cardClock);
         cardClock = undefined;
         state.steerReply = undefined;
@@ -4720,6 +4769,8 @@ export function createOrchestrator(
         .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
         .catch((sendError) => log.fail('intake', sendError, { phase: 'run-failure-feedback', dropped }));
     } finally {
+      nativeRequests.closeThread(opts.thread.sessionId);
+      opts.thread.setNativeRequestHandler?.(null);
       // A replacement run may have reserved the key while failure feedback
       // was in flight. Never delete another run's reservation.
       if (active.get(activeKey) === state) active.delete(activeKey);
@@ -4976,6 +5027,13 @@ export function createOrchestrator(
     });
 
     try {
+      opts.thread.setNativeRequestHandler?.((request) => nativeRequests.receive(request, {
+        chatId: opts.chatId,
+        cwd: runCwd,
+        requesterOpenId: opts.requesterOpenId ?? '',
+        replyTo: opts.replyTo,
+        replyInThread: !opts.flat,
+      }));
       const run = opts.thread.runGoal(objective);
       state.run = run;
       // ⏹ 终止: clear the goal first (so it won't reactivate on resume), then end
@@ -5015,7 +5073,12 @@ export function createOrchestrator(
       const guarded = withIdleTimeout(run.events, GOAL_IDLE_MS, () => {
         idledOut = true;
       }, stop, run.lastActivity);
+      let goalPlanCard: NativePlanCard | null = null;
       for await (const ev of guarded) {
+        if (ev.type === 'native_request_resolved') {
+          nativeRequests.closeRequest(opts.thread.sessionId, ev.requestId);
+          continue;
+        }
         if (ev.type === 'goal_update') {
           lastStatus = ev.status;
           goalTokens = ev.tokensUsed;
@@ -5037,6 +5100,8 @@ export function createOrchestrator(
           continue;
         }
         if (ev.type === 'turn_started') {
+          await goalPlanCard?.finish();
+          goalPlanCard = new NativePlanCard(channel, opts.chatId, opts.replyTo, !opts.flat);
           // Unlike runGoal() construction, this proves the host accepted and
           // started the goal's first turn. Generate in parallel from here.
           beginGoalSessionTitle();
@@ -5046,6 +5111,9 @@ export function createOrchestrator(
           continue;
         }
         if (ev.type === 'done') {
+          await goalPlanCard?.finish();
+          goalPlanCard = null;
+          nativeRequests.closeTurn(opts.thread.sessionId, ev.turnId);
           // turn/completed for an intermediate turn — finalize its card (if any).
           // codex auto-continues with the next turn (a terminal goal status, handled
           // after the loop, preempts the final turn's done).
@@ -5060,6 +5128,7 @@ export function createOrchestrator(
           if (goalEnded) break;
           continue;
         }
+        goalPlanCard?.apply(ev);
         if (ev.type === 'error') {
           goalErrorMsg = ev.message;
           if (!cur) continue; // set-failure before any turn → terminal card only
@@ -5121,6 +5190,8 @@ export function createOrchestrator(
         .send(opts.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
         .catch(() => undefined);
     } finally {
+      nativeRequests.closeThread(opts.thread.sessionId);
+      opts.thread.setNativeRequestHandler?.(null);
       clearInterval(cur?.clock);
       active.delete(activeKey);
       if (cur?.cardMsgId) runsByCard.delete(cur.cardMsgId);

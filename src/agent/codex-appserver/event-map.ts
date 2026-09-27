@@ -41,6 +41,13 @@ export function mapNotification(n: ServerNotification, ctx?: MapContext): AgentE
       return { type: 'turn_started', turnId: n.params.turn.id };
     case 'item/agentMessage/delta':
       return { type: 'text_delta', itemId: n.params.itemId, delta: n.params.delta };
+    case 'item/plan/delta':
+      return { type: 'plan_delta', itemId: n.params.itemId, delta: n.params.delta };
+    case 'turn/plan/updated':
+      return { type: 'plan_steps', explanation: n.params.explanation,
+        steps: n.params.plan.map((step) => ({ step: step.step, status: step.status })) };
+    case 'serverRequest/resolved':
+      return { type: 'native_request_resolved', requestId: n.params.requestId };
     case 'item/reasoning/textDelta':
       return { type: 'thinking_delta', itemId: n.params.itemId, delta: n.params.delta };
     case 'item/started':
@@ -117,6 +124,8 @@ function mapItemStart(item: ThreadItem, ctx?: MapContext): AgentEvent | null {
 
 function mapItemComplete(item: ThreadItem): AgentEvent | null {
   switch (item.type) {
+    case 'plan':
+      return { type: 'plan', itemId: item.id, text: item.text };
     case 'agentMessage':
       return { type: 'text', itemId: item.id, text: item.text };
     case 'reasoning': {

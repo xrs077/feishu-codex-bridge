@@ -15,6 +15,16 @@ function itemCompleted(item: ThreadItem): ServerNotification {
 }
 
 describe('mapNotification', () => {
+  it('maps native Plan deltas, completed plan and step updates', () => {
+    expect(mapNotification(notification('item/plan/delta', { threadId: 'thread-1', turnId: 'turn-1', itemId: 'p1', delta: 'draft' })))
+      .toEqual({ type: 'plan_delta', itemId: 'p1', delta: 'draft' });
+    expect(mapNotification(itemCompleted({ type: 'plan', id: 'p1', text: 'final plan' } as ThreadItem)))
+      .toEqual({ type: 'plan', itemId: 'p1', text: 'final plan' });
+    expect(mapNotification(notification('turn/plan/updated', { threadId: 'thread-1', turnId: 'turn-1', explanation: 'why',
+      plan: [{ step: 'Audit', status: 'completed' }, { step: 'Build', status: 'inProgress' }] })))
+      .toEqual({ type: 'plan_steps', explanation: 'why', steps: [{ step: 'Audit', status: 'completed' }, { step: 'Build', status: 'inProgress' }] });
+  });
+
   it('maps thread and turn lifecycle notifications', () => {
     expect(mapNotification(notification('thread/started', { thread: { id: 'thread-1' } }))).toEqual({
       type: 'system',

@@ -59,6 +59,13 @@ interface Pending {
   reject: (e: Error) => void;
 }
 
+/** Server-initiated JSON-RPC requests must be answered on this same connection. */
+export interface AppServerRequest {
+  id: number | string;
+  method: string;
+  params: unknown;
+}
+
 /** 应用层 JSON-RPC error 应答——进程本身是健康的（它好好地回了包）。按失败
  * 弃置/重建进程的调用方（client-pool 的 utilityRequest）必须把它与超时/传输层
  * 失败区分开：杀掉健康的共享进程会 failAllPending 殃及并发在飞的其他请求。 */
@@ -90,6 +97,7 @@ export class AppServerClient {
   private readonly notifications = new AsyncQueue<ServerNotification>();
   private closed = false;
   private hasExited = false;
+  private serverRequestHandler: ((request: AppServerRequest) => void) | null = null;
 
   constructor(private readonly opts: AppServerClientOptions) {}
 
@@ -177,6 +185,21 @@ export class AppServerClient {
   notify(method: string, params?: unknown): void {
     if (this.closed || !this.child) return;
     this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params: params ?? {} })}\n`);
+  }
+
+  setServerRequestHandler(handler: ((request: AppServerRequest) => void) | null): void {
+    this.serverRequestHandler = handler;
+  }
+
+  /** Resolve the original server request; this does not create a Codex turn. */
+  respond(requestId: number | string, result: unknown): void {
+    if (this.closed || !this.child) throw new UnsentRequestError('app-server client closed');
+    this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, result })}\n`);
+  }
+
+  rejectServerRequest(requestId: number | string, message = 'not handled'): void {
+    if (this.closed || !this.child) return;
+    this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, error: { code: -32601, message } })}\n`);
   }
 
   /** async-iterate server notifications (closes when the process exits). */
@@ -270,12 +293,19 @@ export class AppServerClient {
       return;
     }
 
-    // server-initiated request (e.g. approval). With approvalPolicy:never these
-    // shouldn't arrive, but reply method-not-found so the server never blocks.
-    if (typeof msg.id === 'number' && typeof msg.method === 'string') {
-      this.child?.stdin.write(
-        `${JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'not handled' } })}\n`,
-      );
+    // Server requests retain their JSON-RPC id until the human answers. A
+    // notification or a new turn cannot stand in for this response.
+    if ((typeof msg.id === 'number' || typeof msg.id === 'string') && typeof msg.method === 'string') {
+      if (this.serverRequestHandler) {
+        try {
+          this.serverRequestHandler({ id: msg.id, method: msg.method, params: msg.params });
+        } catch (err) {
+          log.fail('agent', err, { phase: 'server-request', method: msg.method });
+          this.rejectServerRequest(msg.id);
+        }
+      } else {
+        this.rejectServerRequest(msg.id);
+      }
       return;
     }
 
