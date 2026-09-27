@@ -6,6 +6,7 @@ import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
 import { shutdownResidentClients } from '../src/agent/codex-appserver/client-pool';
 
 const live = process.env.RUN_CODEX_NATIVE_LIVE === '1' ? it : it.skip;
+const liveTimeoutMs = Number(process.env.CODEX_NATIVE_LIVE_TIMEOUT_MS ?? 240_000);
 afterAll(shutdownResidentClients);
 
 live('current Codex app-server asks and resumes within a native Plan turn', async () => {
@@ -32,11 +33,11 @@ live('current Codex app-server asks and resumes within a native Plan turn', asyn
       { collaborationMode: 'plan' }).events) events.push(event.type);
     })();
     await Promise.race([consume, new Promise((_, reject) => setTimeout(() =>
-      reject(new Error(`live Plan timeout; requests=${requests.join(',')}; events=${events.join(',')}`)), 30_000))]);
+      reject(new Error(`live Plan timeout; requests=${requests.join(',')}; events=${events.join(',')}`)), liveTimeoutMs))]);
     expect(requests).toContain('item/tool/requestUserInput');
     expect(events).toContain('done');
   } finally {
     await thread.close();
     rmSync(cwd, { recursive: true, force: true });
   }
-}, 40_000);
+}, liveTimeoutMs + 10_000);

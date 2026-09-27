@@ -22,4 +22,4 @@ Bridge 重启后从持久 session 映射恢复 thread，并使旧卡失效。旧
 
 ## 当前检查点
 
-P0 代码已实现并在模拟 app-server 上验证关键同 turn 闭环；真实 app-server 已确认接受 Plan turn，但模型在探针超时内未返回事件。飞书实机与重启 pending 恢复未验收。所有凭证应由本机配置流程创建，不写入仓库。
+P0 代码已实现并在模拟 app-server 上验证关键同 turn 闭环；真实 app-server 已接受 Plan turn，首次探针的会话记录还显示原生提问与回答 `A`，但测试到时中断，尚未验证最终 Plan 完成。飞书实机与重启 pending 恢复未验收。所有凭证应由本机配置流程创建，不写入仓库。

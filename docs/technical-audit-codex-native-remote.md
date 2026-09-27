@@ -28,5 +28,5 @@ JayZtwo 工程可参考原生审批转发的交互，但当前基线的 session�
 - 当前每个会话的 app-server 是 Bridge 子进程。Bridge 重启后，持久化 session 映射可用 `thread/resume` 找回 thread；旧连接上的 pending JSON-RPC request 无法迁移到新进程。Case 6 的“pending 原地恢复”尚无协议证据，不能宣称通过。
 - `on-request` 改变上游原先“永不逐条审批”的行为。只有项目授权用户可触发任务，卡片回答还校验群、项目 cwd、任务发起人或管理员；依然需要实机检查沙箱和飞书回调。
 - 本机没有 `~/.feishu-codex-bridge/` 机器人配置，因此不能做手机飞书端到端验收。模拟 app-server 集成测试覆盖同一 turn 继续。
-- 真实本机 app-server 探针两次收到 `turn_started`，但 30 秒和 120 秒内均未收到模型事件或原生提问；这是运行态阻断，尚不能判断是模型服务、账户、网络还是协议兼容问题。测试命令为 `RUN_CODEX_NATIVE_LIVE=1 npx vitest run test/native-plan.live.test.ts`，默认测试套件跳过该探针。
+- 真实本机 app-server 探针均收到 `turn_started`。首次运行约 117 秒后，Codex 会话记录出现 `request_user_input` 调用，5 毫秒后记录回答 `A`；测试约 3 秒后到达 120 秒超时并中断，故最终 Plan 完成尚未验证。第二次 30 秒探针只收到 `turn_started`。当前模型响应速度使短超时无效；默认测试套件跳过该探针，可用 `RUN_CODEX_NATIVE_LIVE=1 CODEX_NATIVE_LIVE_TIMEOUT_MS=240000 npx vitest run test/native-plan.live.test.ts` 再验收。会话记录位于 `$CODEX_HOME/sessions/2026/09/27/`，不纳入仓库。
 - Desktop/CLI 既有运行 turn 的接管需独立研究其连接所有权和多客户端订阅语义，不能以 Bridge 自持会话测试外推。
